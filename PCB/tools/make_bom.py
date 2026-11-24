@@ -1,117 +1,238 @@
-"""Build hardware/BOM.xlsx (what to buy) from tools/design.py.  Prices are left for you to fill in."""
-import os, sys, math
-HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE)
-import design as D
+"""Build hardware/BOM.xlsx from tools/design.py (Rev D - 100% Through-Hole, Zero SMD)."""
+import collections, os, sys
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
-OUT = os.path.join(os.path.dirname(HERE), 'hardware', 'BOM.xlsx')
-F = 'Arial'
-HDR = PatternFill('solid', fgColor='1F3864'); BAND = PatternFill('solid', fgColor='EEF2F8'); YEL = PatternFill('solid', fgColor='FFFF00')
-thin = Side(style='thin', color='BFBFBF'); BOX = Border(left=thin, right=thin, top=thin, bottom=thin)
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+import design as D
 
-# (group key -> row).  refs are taken from design.PARTS so the list can't drift from the board.
-by_ref = {p['ref']: p for p in D.PARTS}
-def refs(*rs): return [r for r in rs if r in by_ref]
-ROWS = [
- # category, refs, description, package, suggested part (verify stock), spare, note
- ('Resistor', refs('R1'), '100 kΩ 1 % thick film', '0805', 'Yageo RC0805FR-07100KL or equivalent', 5, 'Battery-sense divider, top leg'),
- ('Resistor', refs('R2'), '22 kΩ 1 % thick film', '0805', 'Yageo RC0805FR-0722KL or equivalent', 5, 'Divider bottom leg (max ADC input at 12.8 V pack ≈ 2.3 V)'),
- ('Resistor', refs('R4', 'R5'), '10 kΩ 1 % thick film', '0805', 'Yageo RC0805FR-0710KL or equivalent', 5, 'Button pull-ups'),
- ('Resistor', refs('R3', 'R6'), '1 kΩ 1 % thick film', '0805', 'Yageo RC0805FR-071KL or equivalent', 5, 'ADC series resistor, power-LED resistor'),
- ('Resistor', refs('R7'), '100 Ω 1 % thick film', '0805', 'Yageo RC0805FR-07100RL or equivalent', 5, 'Status-LED resistor'),
- ('Capacitor', refs('C4', 'C5', 'C6', 'C7', 'C8', 'C9', 'C10', 'C11'), '100 nF, 50 V, X7R', '0805', 'Samsung CL21B104KBCNNNC or equivalent', 10, 'Decoupling / debounce / ADC filter'),
- ('Capacitor', refs('C2', 'C3'), '10 µF, 25 V, X5R/X7R', '0805', 'Samsung CL21A106KAYNNNE or equivalent', 4, '5 V and 3.3 V bulk'),
- ('Capacitor', refs('C1'), '10 µF, 25 V, X5R/X7R', '1206', 'Samsung CL31A106KAHNNNE or equivalent', 2, 'Buck input bulk'),
- ('Capacitor', refs('C13'), '22 µF, ≥16 V, X5R', '1206', 'Samsung CL31A226KAHNNNE or equivalent', 2, 'AMS1117 output, needs ≥ 22 µF'),
- ('Capacitor', refs('C12'), '100 µF, 16 V, low-ESR electrolytic', 'Radial D5 mm, 2.0 mm pitch', 'any 105 °C low-ESR 100 µF/16 V, 5 mm', 1, 'Bulk at the battery / ESC tap'),
- ('Capacitor', refs('C14'), '470 µF, 16 V, low-ESR electrolytic', 'Radial D8 mm, 3.5 mm pitch', 'any 105 °C low-ESR 470 µF/16 V, 8 mm', 1, 'Buck-input hold-up. A fresh alkaline pack is ≈ 12.8 V, so 16 V is the minimum rating'),
- ('LED', refs('D1'), 'LED green, 20 mA class', '0805', 'any 0805 green LED', 4, 'Power indicator (3.3 V, 1 kΩ)'),
- ('LED', refs('D2'), 'LED blue, 20 mA class', '0805', 'any 0805 blue LED', 4, 'Status indicator (100 Ω; blue Vf ≈ 3 V, current is small)'),
- ('Diode', refs('D3', 'D5'), 'Schottky 40 V 3 A', 'SMB (DO-214AA)', 'SS34 (many makers)', 2, 'D3 reverse-polarity, D5 buck → VSYS'),
- ('Diode', refs('D4'), 'TVS 16 V unidirectional, 600 W', 'SMB (DO-214AA)', 'SMBJ16A (many makers)', 1, 'Surge clamp on the fused battery rail'),
- ('Fuse', refs('F1'), '15 A fuse, rated ≥ 24 V DC', '2920 (7451 metric) SMD', '2920 SMD fuse, 15 A – check the footprint/current rating of the exact part', 1, 'Protects ESC feed and logic. Make sure its DC voltage rating ≥ 12.8 V'),
- ('IC', refs('U2'), '12 V → 5 V, 0.5 A DC-DC module', 'SIP-3 (RECOM R-78E)', 'RECOM R-78E5.0-0.5', 1, 'Logic supply (input range 7–34 V)'),
- ('IC', refs('U3'), '3.3 V 1 A LDO', 'SOT-223', 'AMS1117-3.3', 2, 'LCD / encoders / IMU rail'),
- ('Connector', refs('J1'), 'XT30PW male, right-angle PCB', 'AMASS XT30PW-M', 'AMASS XT30PW-M', 1, 'Battery in. Mates with a female XT30 plug on the pack lead'),
- ('Connector', refs('J2'), 'XT30PW female, right-angle PCB', 'AMASS XT30PW-F', 'AMASS XT30PW-F', 1, 'ESC power out. Mates with a male XT30 plug on the ESC lead'),
- ('Connector', refs('J4', 'J5', 'J6'), 'JST PH 2.0 mm, 4-pin, top entry', 'B4B-PH-K', 'JST B4B-PH-K-S', 1, 'Encoders L/R and IMU'),
- ('Connector', refs('J8', 'J9'), 'JST XH 2.5 mm, 2-pin, top entry', 'B2B-XH-A', 'JST B2B-XH-A', 1, 'START / MODE buttons'),
- ('Connector', refs('J3'), '1×2 male pin header, 2.54 mm', 'PinHeader 1x02', '2.54 mm breakaway male header strip', 1, 'Power switch / jumper. Buy a 1×40 strip and snap'),
- ('Connector', refs('J10'), '1×3 male pin header, 2.54 mm', 'PinHeader 1x03', '2.54 mm breakaway male header strip', 1, 'ESC PWM'),
- ('Connector', refs('J7'), '2×4 male pin header, 2.54 mm', 'PinHeader 2x04', '2.54 mm breakaway male header, 2 rows', 1, 'LCD. Buy a 2×40 strip and snap'),
+# Exact verified in-stock Through-Hole (THT) parts keyed by (value, fp)
+CATALOG = {
+    ("RPi Pico 2 (RP2350)", "RobotEV:Pico2_Socket_2x20_P2.54mm"):
+        ("2x 1x20 female pin header (2.54 mm, THT)", "Generic / Samtec",
+         "SSQ-120-01-T-S (or 2x 20-pin 2.54mm female socket)", "DigiKey / Amazon", 1.50,
+         "Solder sockets into PCB; plug RPi Pico 2 in with USB facing south edge"),
+    ("15A Mini Blade", "Fuse:Fuseholder_Blade_Mini_Keystone_3568"):
+        ("PCB Mini Automotive Blade Fuse Holder (30 A) + 15 A Mini Blade Fuse", "Keystone / Littelfuse",
+         "3568 (DigiKey 36-3568-ND) + 0297015.WXNV (15A)", "DigiKey / Mouser", 2.00,
+         "Tool-free 2-second fuse swap; buy spare 15 A mini blade fuses"),
+    ("P6KE18A", "Diode_THT:D_DO-15_P10.16mm_Horizontal"):
+        ("TVS diode 600 W unidirectional, 15.3 V standoff (DO-15 axial THT)", "Littelfuse / Yageo",
+         "P6KE18A", "DigiKey / Mouser", 0.45,
+         "Clamps brushed-motor inductive spikes; cathode band (K) to VBAT_F"),
+    ("1N5822", "Diode_THT:D_DO-201AD_P12.70mm_Horizontal"):
+        ("Schottky diode 40 V 3 A (DO-201AD axial THT)", "ON Semi / Vishay / Diodes Inc.",
+         "1N5822 (or 1N5822G)", "DigiKey / Mouser", 0.40,
+         "D3 = reverse-polarity + hold-up isolator; D5 = +5V->VSYS OR-ing (same part)"),
+    ("470uF 25V", "Capacitor_THT:CP_Radial_D8.0mm_P3.50mm"):
+        ("470 uF 25 V radial aluminum electrolytic (D8.0 mm, P3.5 mm, low-ESR)", "Nichicon / Panasonic",
+         "UPW1E471MPD (or EEU-FR1E471)", "DigiKey / Mouser", 0.55,
+         "Upgraded to 25 V rating for fresh 8xAA packs (13.2 V); '+' lead = square pad"),
+    ("10uF 50V", "Capacitor_THT:C_Disc_D6.0mm_W4.4mm_P5.00mm"):
+        ("10 uF 50 V X7R/X7S radial ceramic MLCC (5.0 mm lead pitch, THT)", "TDK / Murata",
+         "FG20X7R1H106KRT00 (alt: RDEC71H106K3K1H03B)", "DigiKey / Mouser", 0.90,
+         "Low-ESR ceramic input (C1) & output (C2) bypass for U2 570 kHz buck"),
+    ("R-78E5.0-0.5", "Converter_DCDC:Converter_DCDC_RECOM_R-78E-0.5_THT"):
+        ("5 V 0.5 A switching buck regulator SIP-3 (7-28 V in, THT)", "RECOM Power",
+         "R-78E5.0-0.5", "DigiKey / Mouser", 3.60,
+         "Drop-in 7805 switching replacement (~88% eff., no heatsink); Pin 1 = square pad"),
+    ("100nF 50V", "Capacitor_THT:C_Disc_D5.0mm_W2.5mm_P5.00mm"):
+        ("100 nF (0.1 uF) 50 V X7R radial ceramic MLCC (5.0 mm pitch, THT)", "KEMET / TDK",
+         "C320C104K5R5TA (alt: FG18X7R1H104KNT06)", "DigiKey / Mouser", 0.25,
+         "C4 = shared east +3V3 bus bypass; C11 = VBAT_ADC 88 Hz LPF (same part)"),
+    ("100k 1%", "Resistor_THT:R_Axial_DIN0207_L6.3mm_D2.5mm_P10.16mm_Horizontal"):
+        ("100 kOhm 1/4 W 1% axial metal film resistor (THT)", "Yageo / Vishay",
+         "MFR-25FBF52-100K", "DigiKey / Mouser", 0.10,
+         "Battery divider top leg (10.16 mm / 0.4 in standard bend pitch)"),
+    ("22k 1%", "Resistor_THT:R_Axial_DIN0207_L6.3mm_D2.5mm_P10.16mm_Horizontal"):
+        ("22 kOhm 1/4 W 1% axial metal film resistor (THT)", "Yageo / Vishay",
+         "MFR-25FBF52-22K", "DigiKey / Mouser", 0.10,
+         "Battery divider bottom leg (12.9 V -> 2.33 V at GP26/ADC0)"),
+    ("BATTERY 8xAA", "Connector_AMASS:AMASS_XT30PW-M_1x02_P2.50mm_Horizontal"):
+        ("XT30PW-M right-angle PCB male plug (THT)", "AMASS",
+         "XT30PW-M", "DigiKey / Amazon / AliExpress", 0.90,
+         "Mates with female XT30 on 8xAA pack; Pin 1 = '-' GND, Pin 2 = '+' VBAT"),
+    ("ESC_POWER", "Connector_AMASS:AMASS_XT30PW-F_1x02_P2.50mm_Horizontal"):
+        ("XT30PW-F right-angle PCB female socket (THT)", "AMASS",
+         "XT30PW-F", "DigiKey / Amazon / AliExpress", 0.90,
+         "Mates with male XT30 on Weka ESC; Pin 1 = '-' GND, Pin 2 = '+' VBAT_F"),
+    ("POWER_SWITCH", "Connector_PinHeader_2.54mm:PinHeader_1x02_P2.54mm_Vertical"):
+        ("2-pin 2.54 mm male header (THT)", "Molex / Amphenol",
+         "22-28-4020 (or breakaway 1x40 strip)", "DigiKey", 0.25,
+         "Connect to panel power switch (or install shunt jumper; <250 mA logic branch)"),
+    ("ENC_LEFT (AS5600)", "Connector_JST:JST_PH_B4B-PH-K_1x04_P2.00mm_Vertical"):
+        ("JST-PH 4-pin 2.0 mm shrouded header (THT)", "JST",
+         "B4B-PH-K-S", "DigiKey / Amazon", 0.35,
+         "Same 4-pin JST-PH header used for J4 (ENC_L), J5 (ENC_R), and J6 (WT901)"),
+    ("ENC_RIGHT (AS5600)", "Connector_JST:JST_PH_B4B-PH-K_1x04_P2.00mm_Vertical"):
+        ("JST-PH 4-pin 2.0 mm shrouded header (THT)", "JST",
+         "B4B-PH-K-S", "DigiKey / Amazon", 0.35,
+         "Pinout: 1=+3V3, 2=GND, 3=SDA, 4=SCL"),
+    ("IMU (WT901)", "Connector_JST:JST_PH_B4B-PH-K_1x04_P2.00mm_Vertical"):
+        ("JST-PH 4-pin 2.0 mm shrouded header (THT)", "JST",
+         "B4B-PH-K-S", "DigiKey / Amazon", 0.35,
+         "Pinout: 1=+3V3, 2=IMU_TX (to WT901 RX), 3=IMU_RX (from WT901 TX), 4=GND"),
+    ("LCD 1.69 (ST7789V2)", "Connector_PinHeader_2.54mm:PinHeader_2x04_P2.54mm_Vertical"):
+        ("2x4 (8-pin) 2.54 mm male pin header (THT)", "Amphenol / Sullins",
+         "68001-108HLF", "DigiKey", 0.40,
+         "Plugs Waveshare 1.69\" LCD 8-wire harness (Pin 1 = square pad, +3V3)"),
+    ("BTN_START", "Connector_JST:JST_XH_B2B-XH-A_1x02_P2.50mm_Vertical"):
+        ("JST-XH 2-pin 2.5 mm shrouded header (THT)", "JST",
+         "B2B-XH-A", "DigiKey / Amazon", 0.30,
+         "Momentary start trigger (pencil tap); GP15 internal pull-up"),
+    ("BTN_MODE", "Connector_JST:JST_XH_B2B-XH-A_1x02_P2.50mm_Vertical"):
+        ("JST-XH 2-pin 2.5 mm shrouded header (THT)", "JST",
+         "B2B-XH-A", "DigiKey / Amazon", 0.30,
+         "Momentary mode select button; GP16 internal pull-up"),
+    ("ESC_PWM", "Connector_PinHeader_2.54mm:PinHeader_1x03_P2.54mm_Vertical"):
+        ("1x3 2.54 mm male pin header (THT)", "Amphenol / Sullins",
+         "68001-103HLF (or breakaway 1x40 strip)", "DigiKey", 0.20,
+         "1=ESC_L (GP2), 2=ESC_R (GP3), 3=GND; leave ESC +5V BEC wire disconnected"),
+}
+
+OFFBOARD = [
+    ("Raspberry Pi Pico 2 (RP2350)", 1, "Raspberry Pi", "SC1631 (with male headers)", "DigiKey / SparkFun", 6.00,
+     "Plugs into U1 sockets; onboard RT6154A supplies +3V3 (300 mA max) and GP25 LED"),
+    ("Weka Dual 20A Brushed ESC", 1, "Just Cuz Robotics", "Weka Dual 20A", "justcuzrobotics.com", 45.00,
+     "XT30 power cable plugs into J2; CH1/CH2/GND servo leads plug into J10"),
+    ("AS5600 magnetic encoder breakout + diametric magnet", 2, "Generic / AliExpress", "AS5600-12bit", "Amazon / AliExpress", 4.00,
+     "Breakouts already include 4.7k I2C pull-ups; wire 4-pin JST-PH to J4/J5"),
+    ("WitMotion WT901 TTL UART IMU", 1, "WitMotion", "WT901", "Amazon / WitMotion", 25.00,
+     "Runs on +3V3 (<25 mA) from J6 so IMU works on USB-only bench testing too"),
+    ("Waveshare 1.69\" 240x280 ST7789V2 IPS LCD", 1, "Waveshare", "1.69inch LCD Module", "Waveshare / Amazon", 13.00,
+     "8-pin female jumper cable plugs onto J7 (+3V3 logic & power, <=90 mA)"),
+    ("8xAA battery holder + XT30-F pigtail + 8x AA NiMH cells", 1, "Eneloop / Tenergy", "8xAA + XT30-F", "Amazon", 22.00,
+     "Double-check XT30 polarity before first plug-in: flat side = '-', round side = '+'"),
+    ("Panel latching toggle/rocker switch (logic power)", 1, "Any SPST >=1 A", "2-pin JST/Dupont to J3", "Amazon / DigiKey", 2.00,
+     "Switches logic branch only (<250 mA); or bridge J3 with a 2.54 mm shunt jumper"),
+    ("Momentary push buttons (start + mode)", 2, "Any NO tactile/arcade", "2-pin JST-XH pigtails", "Amazon", 1.50,
+     "Plug into J8 (START, pencil-tap) and J9 (MODE)"),
+    ("JST-PH 4-pin & JST-XH 2-pin pre-crimped harness kit", 1, "Generic", "JST-PH4 / XH2", "Amazon", 9.00,
+     "Pre-crimped leads for J4, J5, J6, J8, J9"),
+    ("Spare 15 A Mini Automotive Blade Fuses (5-pack)", 1, "Littelfuse", "0297015.WXNV", "AutoZone / DigiKey", 4.00,
+     "Competition spares; tool-free swap into Keystone 3568 holder F1"),
+    ("PCB fabrication (85x65 mm, 2-layer, 1.6 mm, 1 oz Cu)", 5, "JLCPCB / PCBWay", "Gerbers from build.py", "jlcpcb.com", 1.00,
+     "Minimum qty 5 (~$5 total + shipping); standard 1 oz Cu is ample (6 mm double-sided bus)"),
 ]
-EXTRA_ROWS = [  # not in design.PARTS but needed to build the board
- ('Connector', ['U1'], '2× 1×20 female socket, 2.54 mm, standard 8.5 mm height', 'Socket 1x20', 'Standard (not low-profile) female header', 1, 'The Pico must stand ~8.5 mm up: small parts sit under it'),
-]
 
-OFFBOARD = [  # category, item, qty, notes
- ('Brain', 'Raspberry Pi Pico 2 (RP2350), no pre-soldered headers needed', 1, 'Plugs into the two sockets. Buy a spare'),
- ('Motors / drive', 'Weka dual brushed 20 A ESC (PWM input)', 1, 'Takes 3 pins on J10; its 5 V BEC is not used'),
- ('Motors / drive', 'DartBox Gecko gearmotor, 22.5:1', 2, 'From your build; wires to the ESC, not the board'),
- ('Sensing', 'AS5600 magnetic encoder board', 2, 'One per wheel, with magnet; I2C on J4 / J5'),
- ('Sensing', 'WitMotion WT901 IMU (TTL UART)', 1, 'On J6; order VCC / RX / TX / GND'),
- ('UI', 'Waveshare 1.69" 240×280 LCD (ST7789V2)', 1, 'Its 8-wire lead goes to J7'),
- ('UI', 'Momentary push button (normally open), panel mount', 2, 'START and MODE, 2 wires each'),
- ('UI', 'Latching switch or toggle, ≥ 2 A, 2 wires', 1, 'Across J3'),
- ('Power', '8×AA battery holder with XT30 (female) lead', 1, 'Or a holder + XT30 female plug to solder'),
- ('Power', 'AA cells (NiMH recommended)', 8, ''),
- ('Power', 'XT30 male plug with 14–16 AWG lead, for the ESC end', 1, 'Mates with J2; skip if the ESC already has one'),
- ('Cables', 'JST PH 4-pin pre-crimped cable, 2.0 mm', 3, 'Encoders ×2, IMU ×1 (or PHR-4 housing + SPH-002T crimps)'),
- ('Cables', 'JST XH 2-pin pre-crimped cable, 2.5 mm', 2, 'Button leads (or XHP-2 housing + SXH-001T crimps)'),
- ('Cables', 'Dupont female-female jumpers, 2.54 mm', 11, '8 for the LCD, 3 for ESC PWM; or a 1×3 servo-style lead'),
- ('Hardware', 'M3 screws + standoffs/spacers (4×)', 4, 'Board is held on a 77 × 57 mm pattern'),
- ('PCB', 'Bare PCB, 85 × 65 mm, 2-layer, 2 oz copper', 5, 'Hardware/gerbers from `python tools/build.py`. Order 5; the minimum is usually 5'),
- ('Tools', 'Solder, flux, fine-tip iron; tweezers; 0805-friendly', 1, 'Hand-solderable: smallest parts are 0805'),
-]
 
-wb = Workbook()
-ws = wb.active; ws.title = 'PCB parts'
-ws['A1'] = 'EV controller board (Rev C): parts to buy'; ws['A1'].font = Font(name=F, size=14, bold=True)
-ws['A2'] = ('Blue cells are yours to edit: Spare, Unit price, Have. Qty is counted from the Refs column. '
-            'Part numbers are suggestions that match the footprints: check stock and datasheet before buying. Prices are left blank on purpose.')
-ws['A2'].font = Font(name=F, size=9, italic=True); ws['A2'].alignment = Alignment(wrap_text=True, vertical='top'); ws.merge_cells('A2:L2'); ws.row_dimensions[2].height = 28
-heads = ['#', 'Category', 'Refs', 'Qty', 'Description / value', 'Package', 'Suggested part (verify)', 'Spare', 'Order qty', 'Unit price ($)', 'Line total ($)', 'Notes']
-HR = 4
-for c, h in enumerate(heads, 1):
-    cell = ws.cell(HR, c, h); cell.font = Font(name=F, bold=True, color='FFFFFF'); cell.fill = HDR; cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True); cell.border = BOX
-r = HR + 1
-for i, (cat, rf, desc, pkg, sug, spare, note) in enumerate(ROWS + EXTRA_ROWS, 1):
-    vals = [i, cat, ', '.join(rf), f'=LEN(C{r})-LEN(SUBSTITUTE(C{r},",",""))+1', desc, pkg, sug, spare, f'=D{r}+H{r}', None, f'=I{r}*J{r}', note]
-    for c, v in enumerate(vals, 1):
-        cell = ws.cell(r, c, v); cell.font = Font(name=F, size=10); cell.border = BOX; cell.alignment = Alignment(vertical='top', wrap_text=c in (3, 5, 6, 7, 12))
-        if i % 2 == 0: cell.fill = BAND
-    ws.cell(r, 8).font = Font(name=F, size=10, color='0000FF'); ws.cell(r, 10).font = Font(name=F, size=10, color='0000FF'); ws.cell(r, 10).number_format = '$#,##0.00;($#,##0.00);-'; ws.cell(r, 11).number_format = '$#,##0.00;($#,##0.00);-'
-    ws.cell(r, 10).fill = YEL
-    r += 1
-last = r - 1
-ws.cell(r, 10, 'Parts total').font = Font(name=F, bold=True); ws.cell(r, 10).alignment = Alignment(horizontal='right')
-t = ws.cell(r, 11, f'=SUM(K{HR+1}:K{last})'); t.font = Font(name=F, bold=True); t.number_format = '$#,##0.00;($#,##0.00);-'
-ws.cell(r + 2, 1, 'Not bought: test points TP1–TP4 are bare copper pads, H1–H4 are M3 holes (screws are on the Off-board sheet). Reference counts come from tools/design.py.').font = Font(name=F, size=9, italic=True)
-for col, w in zip('ABCDEFGHIJKL', [4, 11, 22, 6, 34, 22, 36, 7, 9, 13, 13, 52]): ws.column_dimensions[col].width = w
-ws.freeze_panes = ws.cell(HR + 1, 1); ws.row_dimensions[HR].height = 30
+def group_pcb_parts():
+    groups = collections.OrderedDict()
+    for p in D.PARTS:
+        ref = p["ref"]
+        if (ref.startswith("H") and ref[1:].isdigit()) or ref.startswith("TP"):
+            continue
+        key = (p["value"], p["fp"])
+        if key not in groups:
+            groups[key] = dict(refs=[], value=p["value"], fp=p["fp"], desc=p["desc"])
+        groups[key]["refs"].append(ref)
+    rows = []
+    for key, g in groups.items():
+        if key not in CATALOG:
+            raise SystemExit("missing CATALOG entry for %r" % (key,))
+        desc, mfr, mpn, vendor, price, notes = CATALOG[key]
+        rows.append((", ".join(g["refs"]), len(g["refs"]), g["value"],
+                     g["fp"].split(":", 1)[-1], desc, mfr, mpn, vendor, price, notes))
+    return rows
 
-w2 = wb.create_sheet('Off-board')
-w2['A1'] = 'Everything else to buy (not on the PCB)'; w2['A1'].font = Font(name=F, size=14, bold=True)
-w2['A2'] = 'Blue cells are yours to edit. Mark "Have" for anything you already own; Order qty then drops to what is left to buy.'; w2['A2'].font = Font(name=F, size=9, italic=True)
-h2 = ['#', 'Category', 'Item', 'Qty needed', 'Have', 'Order qty', 'Unit price ($)', 'Line total ($)', 'Notes']
-for c, h in enumerate(h2, 1):
-    cell = w2.cell(4, c, h); cell.font = Font(name=F, bold=True, color='FFFFFF'); cell.fill = HDR; cell.alignment = Alignment(horizontal='center', wrap_text=True); cell.border = BOX
-r = 5
-for i, (cat, item, q, note) in enumerate(OFFBOARD, 1):
-    vals = [i, cat, item, q, 0, f'=MAX(D{r}-E{r},0)', None, f'=F{r}*G{r}', note]
-    for c, v in enumerate(vals, 1):
-        cell = w2.cell(r, c, v); cell.font = Font(name=F, size=10); cell.border = BOX; cell.alignment = Alignment(vertical='top', wrap_text=c in (3, 9))
-        if i % 2 == 0: cell.fill = BAND
-    for c in (4, 5, 7): w2.cell(r, c).font = Font(name=F, size=10, color='0000FF')
-    w2.cell(r, 7).fill = YEL; w2.cell(r, 7).number_format = '$#,##0.00;($#,##0.00);-'; w2.cell(r, 8).number_format = '$#,##0.00;($#,##0.00);-'
-    r += 1
-w2.cell(r, 7, 'Off-board total').font = Font(name=F, bold=True); w2.cell(r, 7).alignment = Alignment(horizontal='right')
-t = w2.cell(r, 8, f'=SUM(H5:H{r-1})'); t.font = Font(name=F, bold=True); t.number_format = '$#,##0.00;($#,##0.00);-'
-w3 = r + 2
-w2.cell(w3, 7, 'Grand total (both sheets)').font = Font(name=F, bold=True); w2.cell(w3, 7).alignment = Alignment(horizontal='right')
-g = w2.cell(w3, 8, f"=H{r}+'PCB parts'!K{last+1}"); g.font = Font(name=F, bold=True); g.number_format = '$#,##0.00;($#,##0.00);-'
-for col, w in zip('ABCDEFGHI', [4, 15, 52, 11, 8, 10, 13, 14, 58]): w2.column_dimensions[col].width = w
-w2.freeze_panes = 'A5'
-wb.save(OUT); print('wrote', OUT)
+
+def style_sheet(ws, headers, widths):
+    hdr_fill = PatternFill("solid", fgColor="1F4E78")
+    hdr_font = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
+    thin = Side(style="thin", color="CCCCCC")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    ws.append(headers)
+    for i, w in enumerate(widths, 1):
+        c = ws.cell(row=1, column=i)
+        c.fill = hdr_fill
+        c.font = hdr_font
+        c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        c.border = border
+        ws.column_dimensions[get_column_letter(i)].width = w
+    ws.row_dimensions[1].height = 26
+    ws.freeze_panes = "A2"
+    return border
+
+
+def main():
+    wb = Workbook()
+    # ---- Sheet 1: PCB Parts (100% THT, 0 SMD)
+    ws = wb.active
+    ws.title = "PCB Parts (All-THT)"
+    headers = ["Ref(s)", "Qty", "Value", "Footprint (THT)", "Description",
+               "Manufacturer", "Part Number (MPN)", "Vendor", "Unit $", "Ext $", "Notes"]
+    widths = [12, 6, 18, 34, 42, 20, 32, 18, 9, 10, 48]
+    border = style_sheet(ws, headers, widths)
+    body_font = Font(name="Calibri", size=10)
+    alt_fill = PatternFill("solid", fgColor="F5F8FC")
+
+    rows = group_pcb_parts()
+    for idx, (refs, qty, val, fp, desc, mfr, mpn, vendor, price, notes) in enumerate(rows, 2):
+        ws.append([refs, qty, val, fp, desc, mfr, mpn, vendor, price, f"=B{idx}*I{idx}", notes])
+        for col in range(1, 12):
+            c = ws.cell(row=idx, column=col)
+            c.font = body_font
+            c.border = border
+            c.alignment = Alignment(vertical="center", wrap_text=True,
+                                    horizontal="center" if col in (2, 9, 10) else "left")
+            if idx % 2 == 1:
+                c.fill = alt_fill
+        ws.cell(row=idx, column=9).number_format = "$#,##0.00"
+        ws.cell(row=idx, column=10).number_format = "$#,##0.00"
+        ws.row_dimensions[idx].height = 24
+
+    tot_row = len(rows) + 2
+    ws.append(["TOTAL", f"=SUM(B2:B{tot_row - 1})", "", "0 SMD / 100% Through-Hole",
+               f"{len(rows)} unique PCB BOM lines (excl. 4 M3 holes & 4 bare test pads)",
+               "", "", "", "", f"=SUM(J2:J{tot_row - 1})", ""])
+    tot_font = Font(name="Calibri", size=11, bold=True)
+    tot_fill = PatternFill("solid", fgColor="D9E1F2")
+    for col in range(1, 12):
+        c = ws.cell(row=tot_row, column=col)
+        c.font = tot_font
+        c.fill = tot_fill
+        c.border = border
+    ws.cell(row=tot_row, column=2).alignment = Alignment(horizontal="center")
+    ws.cell(row=tot_row, column=10).number_format = "$#,##0.00"
+    ws.cell(row=tot_row, column=10).alignment = Alignment(horizontal="center")
+
+    # ---- Sheet 2: Off-board modules & PCB fab
+    ws2 = wb.create_sheet("Off-Board & Fab")
+    headers2 = ["Item", "Qty", "Manufacturer", "Part / Spec", "Vendor", "Unit $", "Ext $", "Notes"]
+    widths2 = [38, 6, 20, 26, 20, 9, 10, 50]
+    border2 = style_sheet(ws2, headers2, widths2)
+    for idx, (item, qty, mfr, spec, vendor, price, notes) in enumerate(OFFBOARD, 2):
+        ws2.append([item, qty, mfr, spec, vendor, price, f"=B{idx}*F{idx}", notes])
+        for col in range(1, 9):
+            c = ws2.cell(row=idx, column=col)
+            c.font = body_font
+            c.border = border2
+            c.alignment = Alignment(vertical="center", wrap_text=True,
+                                    horizontal="center" if col in (2, 6, 7) else "left")
+            if idx % 2 == 1:
+                c.fill = alt_fill
+        ws2.cell(row=idx, column=6).number_format = "$#,##0.00"
+        ws2.cell(row=idx, column=7).number_format = "$#,##0.00"
+        ws2.row_dimensions[idx].height = 24
+    tot2 = len(OFFBOARD) + 2
+    ws2.append(["TOTAL", f"=SUM(B2:B{tot2 - 1})", "", "", "", "", f"=SUM(G2:G{tot2 - 1})", ""])
+    for col in range(1, 9):
+        c = ws2.cell(row=tot2, column=col)
+        c.font = tot_font
+        c.fill = tot_fill
+        c.border = border2
+    ws2.cell(row=tot2, column=2).alignment = Alignment(horizontal="center")
+    ws2.cell(row=tot2, column=7).number_format = "$#,##0.00"
+    ws2.cell(row=tot2, column=7).alignment = Alignment(horizontal="center")
+
+    out_path = os.path.join(os.path.dirname(HERE), "hardware", "BOM.xlsx")
+    wb.save(out_path)
+    total_qty = sum(r[1] for r in rows)
+    total_cost = sum(r[1] * r[8] for r in rows)
+    print(f"wrote {out_path} ({len(rows)} unique PCB lines, {total_qty} soldered parts, ~${total_cost:.2f}/board)")
+
+
+if __name__ == "__main__":
+    main()

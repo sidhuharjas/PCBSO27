@@ -1,12 +1,13 @@
-"""Re-place, route and finish hardware/RobotEV.kicad_pcb  --  pure Python, no KiCad needed.
+"""Re-place, sync footprints, route and finish hardware/RobotEV.kicad_pcb -- pure Python.
 
-    python tools/relayout.py            # place + route + stitch + silkscreen, writes the board
+    python tools/relayout.py            # sync + place + route + stitch + silkscreen, writes board
     python tools/relayout.py --check    # only run the built-in DRC on the current board file
 
-Footprints are taken from the board file itself (they are KiCad's own, as exported by gen_pcb.py);
-nets come from tools/design.py; positions from tools/placement.py.  Existing tracks, vias and
-silkscreen text are discarded and regenerated, so the result is deterministic.
-KiCad is still the final authority: build.py runs KiCad's DRC and refills the GND pours afterwards.
+Footprints already in the board are reused; any footprint whose library name changed in
+tools/design.py is loaded from tools/kicad10_tht_fps/ (official KiCad 10 THT footprints).
+Removed parts are pruned automatically.  Existing tracks, vias and silkscreen text are
+discarded and regenerated, so the result is deterministic.
+KiCad is still the final authority: build.py runs KiCad's DRC and refills the GND pours.
 """
 import copy, itertools, math, os, random, sys, uuid
 import numpy as np
@@ -18,20 +19,98 @@ D.BOARD_W, D.BOARD_H, D.CORNER_R = PL.BOARD_W, PL.BOARD_H, PL.CORNER_R
 ROOT = os.path.dirname(HERE)
 PCB = os.path.join(ROOT, 'hardware', 'RobotEV.kicad_pcb')
 BUILD = os.path.join(ROOT, 'build')
+RENDERS = os.path.join(ROOT, 'renders')
+FP_DIR = os.path.join(HERE, 'kicad10_tht_fps')
 
-POWER_W = {'VBAT': [3.0, 2.0, 1.2, 0.8], 'VBAT_F': [2.5, 2.0, 1.2, 0.8],
-           'VBAT_SW': [0.8, 0.5, 0.3], 'VBAT_D': [0.8, 0.5, 0.3],
-           '+5V': [0.5, 0.4, 0.3, 0.25], '+3V3': [0.5, 0.4, 0.3, 0.25], 'VSYS': [0.5, 0.4, 0.3]}
-SIG_W = [0.25, 0.2]
-# layer-cost per net: (F.Cu, B.Cu).  Power spines live on B.Cu, signals on F.Cu.
-LCOST = {'+5V': (1.6, 1.0), '+3V3': (1.6, 1.0)}
+POWER_W = {'VBAT': [3.0, 2.5, 2.0, 1.5], 'VBAT_F': [3.0, 2.5, 2.0, 1.5],
+           'VBAT_SW': [1.0, 0.8, 0.5], 'VBAT_D': [1.0, 0.8, 0.5],
+           '+5V': [0.6, 0.5, 0.4], '+3V3': [0.6, 0.5, 0.4], 'VSYS': [0.6, 0.5, 0.4]}
+SIG_W = [0.3, 0.25, 0.2]
+# layer-cost per net: (F.Cu, B.Cu).  +3V3 spine lives on B.Cu so signals on F.Cu never cross it.
+LCOST = {'+3V3': (1.7, 1.0)}
 ORDER = ['VBAT', 'VBAT_F', 'VBAT_SW', 'VBAT_D', 'VSYS', '+5V', '+3V3']
 
 def uid(): return str(uuid.uuid4())
 
+
+# ------------------------------------------------------------------ footprint sync
+def _ensure_uuid(node):
+    """Ensure `node` has a fresh (uuid ...) child (KiCad 10 format)."""
+    old = sx.first(node, 'uuid')
+    if old:
+        old[1] = uid()
+    else:
+        node.append([sx.Sym('uuid'), uid()])
+
+
+def load_tht_footprint(fp_spec, ref, value, desc=''):
+    """Load an official KiCad 10 .kicad_mod from tools/kicad10_tht_fps/ as a board footprint node."""
+    fp_name = fp_spec.split(':', 1)[1] if ':' in fp_spec else fp_spec
+    mod_path = os.path.join(FP_DIR, fp_name + '.kicad_mod')
+    if not os.path.exists(mod_path):
+        raise SystemExit('missing THT footprint template: ' + mod_path)
+    node = sx.parse(open(mod_path, encoding='utf-8').read())
+    # Strip standalone .kicad_mod headers not allowed on embedded board footprints
+    for tag in ('version', 'generator', 'generator_version'):
+        c = sx.first(node, tag)
+        if c:
+            node.remove(c)
+    # Insert (uuid ...) and (at 0 0) right after (layer ...)
+    lay_idx = next(i for i, c in enumerate(node) if isinstance(c, list) and c[0] == 'layer')
+    node.insert(lay_idx + 1, [sx.Sym('uuid'), uid()])
+    node.insert(lay_idx + 2, [sx.Sym('at'), 0, 0])
+    # Update properties
+    for pr in sx.find(node, 'property'):
+        if pr[1] == 'Reference':
+            pr[2] = ref
+        elif pr[1] == 'Value':
+            pr[2] = value
+            if not sx.first(pr, 'hide'):
+                pr.insert(4, [sx.Sym('hide'), sx.Sym('yes')])
+        elif pr[1] == 'Description':
+            pr[2] = desc
+        _ensure_uuid(pr)
+    for tag in ('fp_line', 'fp_rect', 'fp_circle', 'fp_arc', 'fp_poly', 'fp_text', 'pad'):
+        for item in sx.find(node, tag):
+            _ensure_uuid(item)
+    return node
+
+
+def sync_footprints(b):
+    """Add/replace/remove footprints in `b` so they match `design.PARTS` exactly."""
+    wanted = {p['ref']: p for p in D.PARTS}
+    # 1. Remove footprints no longer in design.PARTS
+    for ref in list(b.fps.keys()):
+        if ref not in wanted:
+            b.root.remove(b.fps[ref].node)
+            del b.fps[ref]
+    # 2. Replace footprints whose library name changed, or update properties on kept ones
+    for part in D.PARTS:
+        ref = part['ref']
+        want_name = part['fp'].split(':', 1)[1] if ':' in part['fp'] else part['fp']
+        existing = b.fps.get(ref)
+        same_fp = existing is not None and (existing.name == want_name or existing.name == part['fp'])
+        if not same_fp:
+            new_node = load_tht_footprint(part['fp'], ref, part['value'], part.get('desc', ''))
+            if existing is not None:
+                idx = b.root.index(existing.node)
+                b.root[idx] = new_node
+            else:
+                last = max(i for i, c in enumerate(b.root) if isinstance(c, list) and c[0] == 'footprint')
+                b.root.insert(last + 1, new_node)
+            b.fps[ref] = geom.FP(new_node)
+        else:
+            for pr in sx.find(existing.node, 'property'):
+                if pr[1] == 'Value':
+                    pr[2] = part['value']
+                elif pr[1] == 'Description':
+                    pr[2] = part.get('desc', '')
+            existing.value = part['value']
+
+
 # ------------------------------------------------------------------ board load / place
 def thin_pico_courtyard(fp):
-    """Pico courtyard = the two socket strips only, so small SMD parts may sit under the module."""
+    """Pico courtyard = the two socket strips only (matches Rev C)."""
     for g in sx.find(fp.node, 'fp_line'):
         if sx.first(g, 'layer')[1] == 'F.CrtYd': fp.node.remove(g)
     for g in sx.find(fp.node, 'fp_rect'):
@@ -43,9 +122,11 @@ def thin_pico_courtyard(fp):
              [sx.Sym('layer'), 'F.CrtYd'], [sx.Sym('uuid'), uid()]]
         fp.node.insert(last + 1, r)
 
+
 def load_and_place():
     b = geom.Board(PCB)
-    # nets from design.py (single source of truth); fixes parts whose pads were left unconnected
+    sync_footprints(b)
+    # nets from design.py (single source of truth)
     for part in D.PARTS:
         fp = b.fps[part['ref']]
         for p in fp.pads:
@@ -54,7 +135,6 @@ def load_and_place():
             nn = sx.first(p.node, 'net')
             if nn: p.node.remove(nn)
             if net:
-                # keep KiCad's element order: net goes after layers / roundrect_rratio
                 idx = max(i for i, c in enumerate(p.node) if isinstance(c, list) and c[0] in ('layers', 'roundrect_rratio', 'remove_unused_layers'))
                 p.node.insert(idx + 1, [sx.Sym('net'), net])
     thin_pico_courtyard(b.fps['U1'])
@@ -69,6 +149,7 @@ def load_and_place():
         for p in fp.pads: p.update(fp)
     return b
 
+
 # ------------------------------------------------------------------ routing
 def route_all(b, seed=0, verbose=True):
     W, H, R = D.BOARD_W, D.BOARD_H, D.CORNER_R
@@ -76,7 +157,7 @@ def route_all(b, seed=0, verbose=True):
     nets = {}
     for ref, fp in b.fps.items():
         for p in fp.pads:
-            o = rt.add_pad(p, ref + '.' + p.num)
+            rt.add_pad(p, ref + '.' + p.num)
             if p.net: nets.setdefault(p.net, []).append(rt.objs[-1])
     nets.pop('GND', None)
     def mstlen(pads):
@@ -85,8 +166,7 @@ def route_all(b, seed=0, verbose=True):
         return sum(d for _, _, d in pv.mst(pts))
     sigs = sorted([n for n in nets if n not in ORDER], key=lambda n: mstlen(nets[n]))
     rnd = random.Random(seed)
-    if seed: 
-        # keep short nets first but jitter
+    if seed:
         sigs.sort(key=lambda n: mstlen(nets[n]) * rnd.uniform(0.7, 1.4))
     result = {}; fails = []
     for n in ORDER + sigs:
@@ -95,7 +175,7 @@ def route_all(b, seed=0, verbose=True):
         lc = LCOST.get(n, (1.0, 1.5))
         res = rt.route_net(n, nets[n], widths, lc)
         if res is None:
-            fails.append(n); 
+            fails.append(n)
             if verbose: print('  FAIL', n)
         else:
             segs, vias, w = res
@@ -103,8 +183,25 @@ def route_all(b, seed=0, verbose=True):
             if verbose: print('  ok  %-10s w=%.2f  %3d seg %d via' % (n, w, len(segs), len(vias)))
     return rt, result, fails
 
+
+def add_backside_power_bus(rt, b, result):
+    """Mirror the 15 A VBAT / VBAT_F power bars onto B.Cu for 2x copper ampacity (6 mm eff.)."""
+    j1_p = next(p for p in b.fps['J1'].pads if p.net == 'VBAT')
+    f1_vbat = sorted([p for p in b.fps['F1'].pads if p.net == 'VBAT'], key=lambda p: p.x)
+    j2_p = next(p for p in b.fps['J2'].pads if p.net == 'VBAT_F')
+    f1_vf = sorted([p for p in b.fps['F1'].pads if p.net == 'VBAT_F'], key=lambda p: p.x)
+    # Build direct B.Cu 3.0 mm bars connecting J1(+) -> F1.1a -> F1.1b and J2(+) -> F1.2a -> F1.2b
+    for net, chain in (('VBAT', [j1_p] + f1_vbat), ('VBAT_F', [j2_p] + f1_vf)):
+        extra = []
+        for a, c in zip(chain, chain[1:]):
+            seg = (round(a.x, 4), round(a.y, 4), round(c.x, 4), round(c.y, 4), 1)
+            extra.append(seg)
+            rt.add_seg(seg[0], seg[1], seg[2], seg[3], 3.0, 1, net)
+        result[net + '@B'] = (extra, [], 3.0)
+
+
 def stitch_vias(rt, b, result):
-    """GND stitching vias on a loose grid wherever both layers are free; returns via list"""
+    """GND stitching vias on a loose grid wherever both layers are free; returns via list."""
     blocked, near, via_ok = rt.masks('GND', 0.25)
     vias = []
     step = 7.5
@@ -112,17 +209,18 @@ def stitch_vias(rt, b, result):
     while gx < D.BOARD_W - 3:
         gy = 3.5
         while gy < D.BOARD_H - 3:
-            # search a small neighbourhood for a legal spot
             best = None
             for dx in np.arange(-1.5, 1.51, 0.1):
                 for dy in np.arange(-1.5, 1.51, 0.1):
-                    i = int(round((gx + dx) / router.G)); j = int(round((gy + dy) / router.G))
+                    x_, y_ = gx + dx, gy + dy
+                    if any(math.hypot(x_ - hx, y_ - hy) < 4.5 for (hx, hy) in PL.HOLES):
+                        continue
+                    i = int(round(x_ / router.G)); j = int(round(y_ / router.G))
                     if 0 <= i < rt.nx and 0 <= j < rt.ny and via_ok[j, i]:
                         d = math.hypot(dx, dy)
                         if best is None or d < best[0]: best = (d, i * router.G, j * router.G)
             if best:
                 x, y = round(best[1], 4), round(best[2], 4)
-                # do not stack vias closer than 2.5 mm
                 if all(math.hypot(x - v[0], y - v[1]) > 5.0 for v in vias):
                     vias.append((x, y)); rt.add_via(x, y, 'GND')
                     blocked, near, via_ok = rt.masks('GND', 0.25)
@@ -130,9 +228,10 @@ def stitch_vias(rt, b, result):
         gx += step
     return vias
 
+
 # ------------------------------------------------------------------ built-in DRC
 def drc(b, segs, vias, verbose=True):
-    """exact geometry check: clearance, shorts, edge, hole-to-hole, connectivity of non-GND nets"""
+    """Exact geometry check: clearance, shorts, edge, hole-to-hole, courtyards, connectivity."""
     objs = []
     for fp in b.fps.values():
         for p in fp.pads:
@@ -143,7 +242,6 @@ def drc(b, segs, vias, verbose=True):
     for v in vias:
         objs.append(dict(k='via', net=v['net'], prim=('cap', v['x'], v['y'], v['x'], v['y'], v['d'] / 2), L='FB', name='via@%.2f,%.2f' % (v['x'], v['y']), fp=None))
     errs = []
-    # bucket by 3 mm cells
     cell = 3.0; buckets = {}
     for i, o in enumerate(objs):
         pr = o['prim']
@@ -180,7 +278,7 @@ def drc(b, segs, vias, verbose=True):
         for x, y in pts:
             if edge_d(x, y) - rad < 0.3 - 1e-6:
                 errs.append(('edge', o['name'], o['net'], '', '', round(edge_d(x, y) - rad, 3))); break
-    # courtyard overlaps (KiCad reports these as errors on this project)
+    # courtyard overlaps
     rects = {}
     for fp in b.fps.values():
         for k, c in enumerate(pcbdraw.courtyards(fp)):
@@ -194,7 +292,7 @@ def drc(b, segs, vias, verbose=True):
     for ref, r in rects.items():
         if r[0] < 0.2 or r[1] < 0.2 or r[2] > D.BOARD_W - 0.2 or r[3] > D.BOARD_H - 0.2:
             errs.append(('courtyard_outside', ref, '', '', '', 0))
-    # tall parts must stay out from under the Pico module (it floats ~8.5 mm above the board)
+    # tall parts must stay out from under the Pico module
     u1 = b.fps['U1']; mod = (u1.x - 10.6, u1.y - 25.6, u1.x + 10.6, u1.y + 25.6)
     for ref in PL.TALL:
         r = None
@@ -208,7 +306,7 @@ def drc(b, segs, vias, verbose=True):
         for (x, y, r, nm) in drills:
             if math.hypot(v['x'] - x, v['y'] - y) - r - v['drill'] / 2 < 0.25:
                 errs.append(('hole_to_hole', 'via@%.2f,%.2f' % (v['x'], v['y']), v['net'], nm, '', 0)); break
-    # connectivity of every routed net (non-GND): union-find over touching copper
+    # connectivity of every routed net (non-GND)
     nets = {}
     for i, o in enumerate(objs):
         if o['net'] and o['net'] != 'GND': nets.setdefault(o['net'], []).append(i)
@@ -231,8 +329,9 @@ def drc(b, segs, vias, verbose=True):
         for o in opens: print('  OPEN', o)
     return errs, opens
 
+
 def pour_connectivity(b, segs, vias, res=0.1):
-    """raster check that every GND pad lands in one connected copper pour (both layers + vias)"""
+    """Raster check that every GND pad lands in one connected copper pour (both layers + vias)."""
     from scipy import ndimage
     W, H, R = D.BOARD_W, D.BOARD_H, D.CORNER_R
     nx, ny = int(W / res) + 1, int(H / res) + 1
@@ -241,7 +340,6 @@ def pour_connectivity(b, segs, vias, res=0.1):
     rt.nx, rt.ny, rt.X, rt.Y, rt.W, rt.H, rt.R = nx, ny, X, Y, W, H, R
     router.G = res
     edge = router.Router._edge_distance(rt)
-    masks = []
     objs = []
     for fp in b.fps.values():
         for p in fp.pads:
@@ -256,7 +354,6 @@ def pour_connectivity(b, segs, vias, res=0.1):
             if l in L and net != 'GND': rt._stamp(m, pr, 0.2 + 0.02)
         fills.append(~m & (edge > 0.6 + 0.02))
     lab = [ndimage.label(f)[0] for f in fills]
-    # union labels of F and B through GND vias / thru pads
     par = {}
     def f(x):
         par.setdefault(x, x)
@@ -269,18 +366,14 @@ def pour_connectivity(b, segs, vias, res=0.1):
     for pr, net, L, p in objs:
         if net != 'GND': continue
         nodes = set()
-        cx, cy = (pr[1], pr[2]) if pr[0] == 'cap' else ((pr[1] + pr[3]) / 2, (pr[2] + pr[4]) / 2)
         for l in L:
-            # any filled pixel inside / touching the pad
             sub = np.zeros((ny, nx), bool); rt._stamp(sub, pr, 0.15)
-            ls = np.unique(lab[l][sub & fills[l]]); 
+            ls = np.unique(lab[l][sub & fills[l]])
             for v in ls:
                 if v: nodes.add((l, int(v)))
-        if p is not None or True:
-            nodes = list(nodes)
-            for a in nodes[1:]: par[f(nodes[0])] = f(a)
-            if p is not None: pad_nodes.append((p.ref + '.' + p.num, nodes))
-    # tracks of net GND are none; vias & THT pads already unify via nodes above (thru pads give both layers)
+        nodes = list(nodes)
+        for a in nodes[1:]: par[f(nodes[0])] = f(a)
+        if p is not None: pad_nodes.append((p.ref + '.' + p.num, nodes))
     for v in vias:
         if v['net'] == 'GND':
             a, c = (0, int(at(0, v['x'], v['y']))), (1, int(at(1, v['x'], v['y'])))
@@ -292,19 +385,32 @@ def pour_connectivity(b, segs, vias, res=0.1):
         comps.setdefault(f(nodes[0]), []).append(nm)
     return comps, bad
 
+
 # ------------------------------------------------------------------ silkscreen
 NAME = 'HARJAS SIDHU'
-MANUAL_LABELS = [  # (text, x, y, angle, size): placed at the nearest free spot to (x, y)
-    ('BATT 8xAA', 20.2, 14.7, 90, 0.8), ('ESC PWR', 20.2, 29.5, 90, 0.8),
-    ('RPI PICO 2', 50.0, 21.0, 0, 1.2), ('USB', 50.0, 60.6, 0, 1.0),
-    (NAME, 79.0, 32.0, 90, 1.2),
+MANUAL_LABELS = [
+    ('BATT 8xAA', 10.5, 6.2, 0, 0.85),
+    ('ESC PWR', 7.0, 38.0, 0, 0.85),
+    ('15A FUSE', 23.5, 11.2, 0, 0.8),
+    ('RPI PICO 2', 50.0, 21.0, 0, 1.2),
+    ('USB', 50.0, 60.6, 0, 1.0),
+    (NAME, 80.5, 32.0, 90, 1.2),
 ]
-LABELS = [  # (text, anchor ref, preferred sides)
-    ('PWR SW', 'J3', ('below', 'above')),
-    ('ENC L', 'J4', ('above',)), ('ENC R', 'J5', ('above',)), ('WT901', 'J6', ('above',)),
-    ('LCD', 'J7', ('above', 'right')), ('START', 'J8', ('below',)), ('MODE', 'J9', ('below',)),
-    ('ESC SIG', 'J10', ('above',)),
+LABELS = [
+    ('PWR SW', 'J3', ('right', 'above', 'left')),
+    ('ENC L', 'J4', ('above', 'right')),
+    ('ENC R', 'J5', ('above', 'right')),
+    ('WT901', 'J6', ('above', 'right')),
+    ('LCD', 'J7', ('above', 'right')),
+    ('START', 'J8', ('below', 'above')),
+    ('MODE', 'J9', ('below', 'above')),
+    ('ESC SIG', 'J10', ('right', 'below', 'above')),
+    ('+5V', 'TP1', ('right', 'above', 'left')),
+    ('+3V3', 'TP2', ('above', 'below', 'right')),
+    ('GND', 'TP3', ('right', 'above', 'left')),
+    ('VSW', 'TP4', ('left', 'above', 'below')),
 ]
+
 
 def fp_world_bbox(fp):
     xs, ys = [], []
@@ -317,44 +423,52 @@ def fp_world_bbox(fp):
         xs += [fp.x + q[0] for q in pts]; ys += [fp.y + q[1] for q in pts]
     return min(xs), min(ys), max(xs), max(ys)
 
-def do_silk(b, root):
-    """strip old silk labels, hide fp reference text, add gr_text refs/labels placed clear of pads"""
-    # remove old board texts
+
+def do_silk(b, root, vias=()):
+    """Strip old silk labels, keep polarity/cathode marks (+/-/K), place refs/labels clear of pads & vias."""
     for n in sx.find(root, 'gr_text'): root.remove(n)
     obstacles = []
+    KEEP_MARKS = ('+', '-', 'K')
+    for v in vias:
+        r = v['d'] / 2 + 0.45
+        obstacles.append((v['x'] - r, v['y'] - r, v['x'] + r, v['y'] + r))
     for fp in b.fps.values():
         for t in list(sx.find(fp.node, 'fp_text')):
             ly = sx.first(t, 'layer')[1]
-            if ly == 'F.SilkS' and t[2] not in ('+', '-'): fp.node.remove(t)
+            if ly == 'F.SilkS' and t[2] not in KEEP_MARKS: fp.node.remove(t)
         for p in fp.pads:
             pr = p.prim()
-            if pr[0] == 'cap': obstacles.append((pr[1] - pr[5] - .3, pr[2] - pr[5] - .3, pr[3] + pr[5] + .3, pr[4] + pr[5] + .3))
-            else: obstacles.append((pr[1] - .3, pr[2] - .3, pr[3] + .3, pr[4] + .3))
-        # silk outlines of this footprint (world bbox of each segment)
+            if pr[0] == 'cap': obstacles.append((pr[1] - pr[5] - .35, pr[2] - pr[5] - .35, pr[3] + pr[5] + .35, pr[4] + pr[5] + .35))
+            else: obstacles.append((pr[1] - .35, pr[2] - .35, pr[3] + .35, pr[4] + .35))
         for g in sx.find(fp.node, 'fp_line') + sx.find(fp.node, 'fp_rect'):
             if sx.first(g, 'layer')[1] != 'F.SilkS': continue
             s_, e_ = sx.first(g, 'start'), sx.first(g, 'end')
             q1 = geom.rot(float(s_[1]), float(s_[2]), fp.a); q2 = geom.rot(float(e_[1]), float(e_[2]), fp.a)
-            obstacles.append((min(q1[0], q2[0]) + fp.x - .15, min(q1[1], q2[1]) + fp.y - .15, max(q1[0], q2[0]) + fp.x + .15, max(q1[1], q2[1]) + fp.y + .15))
+            obstacles.append((min(q1[0], q2[0]) + fp.x - .25, min(q1[1], q2[1]) + fp.y - .25, max(q1[0], q2[0]) + fp.x + .25, max(q1[1], q2[1]) + fp.y + .25))
         for g in sx.find(fp.node, 'fp_circle'):
             if sx.first(g, 'layer')[1] != 'F.SilkS': continue
             c_, e_ = sx.first(g, 'center'), sx.first(g, 'end')
             q = geom.rot(float(c_[1]), float(c_[2]), fp.a); r = math.hypot(float(e_[1]) - float(c_[1]), float(e_[2]) - float(c_[2]))
-            obstacles.append((fp.x + q[0] - r, fp.y + q[1] - r, fp.x + q[0] + r, fp.y + q[1] + r))
-    # +/- marks inside footprints are obstacles too
+            obstacles.append((fp.x + q[0] - r - .2, fp.y + q[1] - r - .2, fp.x + q[0] + r + .2, fp.y + q[1] + r + .2))
     for fp in b.fps.values():
         for t in sx.find(fp.node, 'fp_text'):
-            if t[2] in ('+', '-') and sx.first(t, 'layer')[1] == 'F.SilkS':
+            if t[2] in KEEP_MARKS and sx.first(t, 'layer')[1] == 'F.SilkS':
                 a = sx.first(t, 'at'); q = geom.rot(float(a[1]), float(a[2]), fp.a)
-                obstacles.append((fp.x + q[0] - .9, fp.y + q[1] - .9, fp.x + q[0] + .9, fp.y + q[1] + .9))
+                obstacles.append((fp.x + q[0] - 1.0, fp.y + q[1] - 1.0, fp.x + q[0] + 1.0, fp.y + q[1] + 1.0))
+    # Keep silkscreen clear of M3 screw heads and component body interiors (except U1 center)
+    for (hx, hy) in PL.HOLES:
+        obstacles.append((hx - 3.6, hy - 3.6, hx + 3.6, hy + 3.6))
+    for ref, fp in b.fps.items():
+        if ref == 'U1' or ref.startswith('TP') or (ref.startswith('H') and ref[1:].isdigit()):
+            continue
+        for c in pcbdraw.courtyards(fp):
+            pts = [geom.rot(*q, fp.a) for q in ((c[0], c[1]), (c[2], c[1]), (c[2], c[3]), (c[0], c[3]))]
+            xs = [fp.x + q[0] for q in pts]; ys = [fp.y + q[1] for q in pts]
+            obstacles.append((min(xs), min(ys), max(xs), max(ys)))
     W, H = D.BOARD_W, D.BOARD_H
     def free(r):
         x0, y0, x1, y1 = r
         if x0 < 1.0 or y0 < 1.0 or x1 > W - 1.0 or y1 > H - 1.0: return False
-        # keep out of the rounded corners
-        for cx, cy in ((D.CORNER_R, D.CORNER_R), (W - D.CORNER_R, D.CORNER_R), (D.CORNER_R, H - D.CORNER_R), (W - D.CORNER_R, H - D.CORNER_R)):
-            if (x0 < D.CORNER_R and y0 < D.CORNER_R) or (x1 > W - D.CORNER_R and y0 < D.CORNER_R) or (x0 < D.CORNER_R and y1 > H - D.CORNER_R) or (x1 > W - D.CORNER_R and y1 > H - D.CORNER_R):
-                if math.hypot(max(abs((x0 + x1) / 2 - cx) - (x1 - x0) / 2, 0), max(abs((y0 + y1) / 2 - cy) - (y1 - y0) / 2, 0)) > D.CORNER_R - 1.0: pass
         for o in obstacles:
             if x0 < o[2] and o[0] < x1 and y0 < o[3] and o[1] < y1: return False
         return True
@@ -362,16 +476,16 @@ def do_silk(b, root):
         n = [sx.Sym('gr_text'), text, [sx.Sym('at'), round(x, 3), round(y, 3), angle], [sx.Sym('layer'), 'F.SilkS'],
              [sx.Sym('uuid'), uid()], [sx.Sym('effects'), [sx.Sym('font'), [sx.Sym('size'), size, size], [sx.Sym('thickness'), thick]]]]
         root.append(n)
-    def tsize(text, size): return len(text) * size * 0.78 + 0.2, size * 1.1
-    def place_text(text, bb, sides, size=0.8, gap=0.6):
+    def tsize(text, size): return len(text) * size * 0.96 + 0.45, size * 1.35 + 0.25
+    def place_text(text, bb, sides, size=0.8, gap=0.5):
         w, h = tsize(text, size)
         cx, cy = (bb[0] + bb[2]) / 2, (bb[1] + bb[3]) / 2
         cands = []
         for s in sides:
-            if s == 'above': cands += [(cx + k, bb[1] - gap - h / 2) for k in (0, -3, 3, -6, 6)]
-            if s == 'below': cands += [(cx + k, bb[3] + gap + h / 2) for k in (0, -3, 3, -6, 6)]
-            if s == 'left': cands += [(bb[0] - gap - w / 2, cy + k) for k in (0, -3, 3)]
-            if s == 'right': cands += [(bb[2] + gap + w / 2, cy + k) for k in (0, -3, 3)]
+            if s == 'above': cands += [(cx + k, bb[1] - gap - h / 2) for k in (0, -2, 2, -4, 4)]
+            if s == 'below': cands += [(cx + k, bb[3] + gap + h / 2) for k in (0, -2, 2, -4, 4)]
+            if s == 'left': cands += [(bb[0] - gap - w / 2, cy + k) for k in (0, -2, 2)]
+            if s == 'right': cands += [(bb[2] + gap + w / 2, cy + k) for k in (0, -2, 2)]
         for k in (1.0, 2.0, 3.0):
             for dx in (-1.5, 0, 1.5):
                 cands += [(cx + dx, bb[1] - gap - h / 2 - k), (cx + dx, bb[3] + gap + h / 2 + k)]
@@ -384,30 +498,26 @@ def do_silk(b, root):
     for text, x0, y0, ang, size in MANUAL_LABELS:
         w, h = tsize(text, size)
         if ang == 90: w, h = h, w
-        cands = sorted(((dx * 0.5, dy * 0.5) for dx in range(-24, 25) for dy in range(-24, 25)), key=lambda d: d[0] ** 2 + d[1] ** 2)
+        cands = sorted(((dx * 0.5, dy * 0.5) for dx in range(-20, 21) for dy in range(-20, 21)), key=lambda d: d[0] ** 2 + d[1] ** 2)
         for dx, dy in cands:
             r = (x0 + dx - w / 2, y0 + dy - h / 2, x0 + dx + w / 2, y0 + dy + h / 2)
             if free(r):
                 add_text(text, x0 + dx, y0 + dy, size=size, thick=0.2 if size > 1 else 0.15, angle=ang); obstacles.append(r); break
         else:
             print('  (no room for silk label %r)' % text)
-    placed = {}
     for text, ref, sides in LABELS:
+        if ref not in b.fps: continue
         bb = fp_world_bbox(b.fps[ref])
         pos = place_text(text, bb, sides + ('above', 'below', 'right', 'left'), 0.8, 0.5)
-        if pos: add_text(text, pos[0], pos[1]); placed[ref] = pos
-    # board name / pico marking
-    u = fp_world_bbox(b.fps['U1'])
-    for line, dy in (('RPI PICO 2', 0), ):
-        pass
+        if pos: add_text(text, pos[0], pos[1])
     # reference designators
     for ref, fp in b.fps.items():
-        if (ref.startswith('H') and ref[1:].isdigit()) or ref in ('J1', 'J2'):
+        if (ref.startswith('H') and ref[1:].isdigit()) or ref in ('J1', 'J2') or ref.startswith('TP'):
             for pr in sx.find(fp.node, 'property'):
                 if pr[1] == 'Reference' and not sx.first(pr, 'hide'): pr.insert(5, [sx.Sym('hide'), sx.Sym('yes')])
             continue
         bb = fp_world_bbox(fp)
-        pos = place_text(ref, bb, ('above', 'below', 'right', 'left'), 0.8 if ref != 'U1' else 1.0, 0.25)
+        pos = place_text(ref, bb, ('above', 'below', 'right', 'left'), 0.8 if ref != 'U1' else 1.0, 0.35)
         for pr in sx.find(fp.node, 'property'):
             if pr[1] != 'Reference': continue
             at = sx.first(pr, 'at')
@@ -423,10 +533,8 @@ def do_silk(b, root):
             ef = sx.first(pr, 'effects'); ft = sx.first(ef, 'font'); sz = sx.first(ft, 'size'); sz[1] = sz[2] = 0.8 if ref != 'U1' else 1.0
             th = sx.first(ft, 'thickness')
             if th: th[1] = 0.13
-    # title
-    for line, ty in (('EV CONTROLLER REV C', H - 2.2),):
-        pass
     return obstacles
+
 
 # ------------------------------------------------------------------ write
 def rebuild_outline(root):
@@ -442,7 +550,6 @@ def rebuild_outline(root):
         items.append([sx.Sym('gr_arc'), [sx.Sym('start'), sx_, sy_], [sx.Sym('mid'), round(mx, 6), round(my, 6)], [sx.Sym('end'), ex, ey], stroke(), [sx.Sym('layer'), 'Edge.Cuts'], [sx.Sym('uuid'), uid()]])
     last = max(i for i, c in enumerate(root) if isinstance(c, list) and c[0] == 'footprint')
     root[last + 1:last + 1] = items
-    # GND pours follow the outline (0.6 mm inset)
     m = 0.6; r = R - m; pts = []
     for (cx, cy, a0) in ((W - R, R, -90), (W - R, H - R, 0), (R, H - R, 90), (R, R, 180)):
         for i in range(0, 13):
@@ -451,8 +558,8 @@ def rebuild_outline(root):
         poly = sx.first(z, 'polygon'); old = sx.first(poly, 'pts')
         old[1:] = [[sx.Sym('xy'), x, y] for x, y in pts]
 
+
 def _voronoi(root, layer, allowed, seed=7, n=78, width=0.2, dot=0.32, min_len=0.3):
-    """Voronoi web as silkscreen lines + node dots on `layer`; `allowed(x, y)` is the keep-in test."""
     from scipy.spatial import Voronoi
     W, H = D.BOARD_W, D.BOARD_H
     def uidn(): return [sx.Sym('uuid'), uid()]
@@ -460,7 +567,7 @@ def _voronoi(root, layer, allowed, seed=7, n=78, width=0.2, dot=0.32, min_len=0.
     n = int(n * (W * H) / (70.0 * 56.0))
     pts = np.column_stack([rng.uniform(0, W, n), rng.uniform(0, H, n)])
     def mirrored(p): return np.vstack([p, p * [-1, 1], p * [1, -1], p * [-1, 1] + [2 * W, 0], p * [1, -1] + [0, 2 * H]])
-    for _ in range(2):                      # light Lloyd relaxation -> even but organic cells
+    for _ in range(2):
         vor = Voronoi(mirrored(pts)); new = pts.copy()
         for i in range(n):
             reg = vor.regions[vor.point_region[i]]
@@ -497,11 +604,13 @@ def _voronoi(root, layer, allowed, seed=7, n=78, width=0.2, dot=0.32, min_len=0.
                      [sx.Sym('fill'), sx.Sym('yes')], [sx.Sym('layer'), layer], uidn()])
     print('  %s voronoi: %d segments, %d node dots' % (layer, lines, len(dots)))
 
+
 def _inside_board(x, y, inset):
     W, H, R = D.BOARD_W, D.BOARD_H, D.CORNER_R
     qx = abs(x - W / 2) - (W / 2 - R); qy = abs(y - H / 2) - (H / 2 - R)
     d = math.hypot(max(qx, 0), max(qy, 0)) + min(max(qx, qy), 0) - R
     return -d >= inset
+
 
 def _hole_list(b, vias):
     holes = []
@@ -512,13 +621,14 @@ def _hole_list(b, vias):
     for v in vias: holes.append((v['x'], v['y'], v['d'] / 2 + 0.55))
     return holes
 
+
 def back_art(b, root, vias, seed=7):
-    """B.SilkS: title (mirrored) + Voronoi web.  Lines stop short of every hole/via/pad and of the text."""
+    """B.SilkS: title (mirrored) + Voronoi web."""
     for n in sx.find(root, 'gr_line') + sx.find(root, 'gr_circle') + sx.find(root, 'gr_text'):
         ly = sx.first(n, 'layer')
         if ly and ly[1] == 'B.SilkS': root.remove(n)
     u1 = b.fps['U1']
-    title = [('EV CONTROLLER', u1.x, u1.y - 13.0, 1.25), ('REV C', u1.x, u1.y - 9.4, 1.25)]
+    title = [('EV CONTROLLER', u1.x, u1.y - 13.0, 1.25), ('REV D - ALL THT', u1.x, u1.y - 9.4, 1.15)]
     keep_rects = []
     for text, x, y, sz in title:
         w = len(text) * sz * 0.9 + 0.6
@@ -535,8 +645,9 @@ def back_art(b, root, vias, seed=7):
         return True
     _voronoi(root, 'B.SilkS', allowed, seed=seed)
 
+
 def front_art(b, root, vias, obstacles, seed=11):
-    """F.SilkS Voronoi web in the free space: clear of pads, part courtyards, screw heads, text and silk outlines."""
+    """F.SilkS Voronoi web in the free space."""
     for n in sx.find(root, 'gr_line') + sx.find(root, 'gr_circle'):
         ly = sx.first(n, 'layer')
         if ly and ly[1] == 'F.SilkS': root.remove(n)
@@ -547,7 +658,7 @@ def front_art(b, root, vias, obstacles, seed=11):
             xs = [fp.x + q[0] for q in pts]; ys = [fp.y + q[1] for q in pts]
             rects.append((min(xs) - 0.5, min(ys) - 0.5, max(xs) + 0.5, max(ys) + 0.5))
     u1 = b.fps['U1']
-    rects.append((u1.x - 10.7, u1.y - 25.7, u1.x + 10.7, u1.y + 25.7))     # under the Pico module
+    rects.append((u1.x - 10.7, u1.y - 25.7, u1.x + 10.7, u1.y + 25.7))
     holes = [(p.x, p.y, 3.6) for fp in b.fps.values() if fp.ref.startswith('H') and fp.ref[1:].isdigit() for p in fp.pads]
     holes += [(v['x'], v['y'], 0.9) for v in vias]
     def allowed(x, y):
@@ -559,6 +670,7 @@ def front_art(b, root, vias, obstacles, seed=11):
         return True
     _voronoi(root, 'F.SilkS', allowed, seed=seed, width=0.18, dot=0.28, min_len=3.0)
 
+
 def write_board(b, root, segs, vias, path, front_obstacles=()):
     rebuild_outline(root)
     back_art(b, root, vias)
@@ -566,12 +678,10 @@ def write_board(b, root, segs, vias, path, front_obstacles=()):
     for n in sx.find(root, 'segment') + sx.find(root, 'via'): root.remove(n)
     for z in sx.find(root, 'zone'):
         for fpoly in sx.find(z, 'filled_polygon'): z.remove(fpoly)
-    # title block
     tb = sx.first(root, 'title_block')
-    for k, v in (('title', 'EV Controller - RP2350 / 8xAA / Weka dual ESC'), ('date', '2026-11-15'), ('rev', 'C')):
+    for k, v in (('title', D.TITLE), ('date', D.DATE), ('rev', D.REV)):
         e = sx.first(tb, k)
         if e: e[1] = v
-    # insert tracks after the last footprint
     last = max(i for i, c in enumerate(root) if isinstance(c, list) and c[0] == 'footprint')
     new = []
     for s in segs:
@@ -584,6 +694,7 @@ def write_board(b, root, segs, vias, path, front_obstacles=()):
     with open(path, 'w', encoding='utf-8', newline='\n') as f:
         f.write(sx.dump(root) + '\n')
 
+
 def to_board_items(result, stitch):
     segs, vias = [], []
     for n, (ss, vv, w) in result.items():
@@ -593,9 +704,11 @@ def to_board_items(result, stitch):
     for v in stitch: vias.append(dict(x=v[0], y=v[1], d=router.VIA_D, drill=router.VIA_DRILL, net='GND'))
     return segs, vias
 
+
 def main():
     if '--check' in sys.argv:
-        b = geom.Board(PCB); drc(b, b.segs, b.vias); return
+        b = geom.Board(PCB); errs, opens = drc(b, b.segs, b.vias)
+        sys.exit(1 if (errs or opens) else 0)
     seed = 0
     for a in sys.argv:
         if a.startswith('--seed='): seed = int(a.split('=')[1])
@@ -608,18 +721,18 @@ def main():
     if best is None:
         print('ROUTING FAILED for', fails); sys.exit(2)
     rt, result = best
+    add_backside_power_bus(rt, b, result)
     stitch = stitch_vias(rt, b, result)
     segs, vias = to_board_items(result, stitch)
     comps, bad = pour_connectivity(b, segs, vias)
-    # any GND pad that ended up on an isolated copper island gets an explicit track to the main pour
     for rnd in range(6):
         if len(comps) <= 1 and not bad: break
-        main = max(comps.values(), key=len)
-        orphans = [nm for g in comps.values() if g is not main for nm in g] + bad
+        main_g = max(comps.values(), key=len)
+        orphans = [nm for g in comps.values() if g is not main_g for nm in g] + bad
         gnd_pads = {o.name: o for o in rt.objs if o.kind == 'pad' and o.net == 'GND'}
         for nm in orphans:
             o = gnd_pads[nm]
-            tgt = min((gnd_pads[m] for m in main), key=lambda q: math.hypot(q.prim[1] - o.prim[1], q.prim[2] - o.prim[2]))
+            tgt = min((gnd_pads[m] for m in main_g), key=lambda q: math.hypot(q.prim[1] - o.prim[1], q.prim[2] - o.prim[2]))
             r = rt.route_net('GND', [o, tgt], [0.4, 0.3, 0.25], (1.0, 1.0))
             print('  GND fix for %s -> %s: %s' % (nm, tgt.name, 'ok' if r else 'FAILED'))
             if r: result['GND@%s' % nm] = r
@@ -629,13 +742,18 @@ def main():
     print('GND pour: %d connected group(s); %d pad(s) with no pour contact %s' % (len(comps), len(bad), bad))
     for k, v in comps.items(): print('   group of %d pads' % len(v), v[:6] if len(v) < 6 else '')
     root = b.root
-    front_obs = do_silk(b, root)
+    front_obs = do_silk(b, root, vias)
     os.makedirs(BUILD, exist_ok=True)
+    os.makedirs(RENDERS, exist_ok=True)
     write_board(b, root, segs, vias, PCB, front_obs)
     print('wrote', PCB)
-    pcbdraw.draw(b, os.path.join(BUILD, 'layout_preview.png'), tracks=segs, vias=vias, title='RobotEV rev C - routed (red F.Cu, blue B.Cu)', labels=False)
-    print('tracks: %.0f mm, %d vias (%d routed + %d GND stitching)' % (sum(math.hypot(s['x2'] - s['x1'], s['y2'] - s['y1']) for s in segs), len(vias), len(vias) - len(stitch), len(stitch)))
+    for out_d in (BUILD, RENDERS):
+        pcbdraw.draw(b, os.path.join(out_d, 'layout_preview.png'), tracks=segs, vias=vias,
+                     title='RobotEV Rev D (All-THT, 0 SMD) - routed (red F.Cu, blue B.Cu)', labels=True)
+    print('tracks: %.0f mm, %d vias (%d routed + %d GND stitching)' %
+          (sum(math.hypot(s['x2'] - s['x1'], s['y2'] - s['y1']) for s in segs), len(vias), len(vias) - len(stitch), len(stitch)))
     if errs or opens or bad: sys.exit(1)
+
 
 if __name__ == '__main__':
     main()
